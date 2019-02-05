@@ -25,17 +25,24 @@ client['timerData'] = new Enmap({
 })
 
 client['loadedModules'] = {}
+client['loadedCommands'] = {}
 
 if (!process.env.BOT_GUILD) {
   log.error('No Discord guild ID supplied. Set the BOT_GUILD environment variable.')
 }
 
+if (!process.env.OWNER_ID) {
+  log.error('No owner user Discord ID supplied. Set the OWNER_ID environment variable.')
+}
+
+client['ownerId'] = process.env.OWNER_ID
+
 if (!process.env.DISCORD_TOKEN) {
   log.error('No Discord authentication token supplied. Set the DISCORD_TOKEN environment variable.')
-} else {
-  client.login(process.env.DISCORD_TOKEN)
-    .catch(console.error)
 }
+
+client.login(process.env.DISCORD_TOKEN)
+      .catch(console.error)
 
 interface Command {
   name: string,
@@ -63,7 +70,7 @@ interface Job {
 
 interface Module {
   name: string,
-  commands: Command[]
+  commands?: Command[]
   jobs?: Job[],
   events?: Event[]
 }
@@ -75,13 +82,22 @@ const loadModule = (name: string) => {
         setInterval(() => x.job(client), x.period * 1000)
         if (x.runInstantly) {
           x.job(client)
-           .then(console.log)
-           .catch(log.error)
+           .catch(log.warn)
         }
       })
     }
+    if (module.commands) {
+      module.commands.map(command => {
+        const possibleNames = command.aliases
+          ? command.aliases.concat([command.name])
+          : [command.name]
+        possibleNames.map(name => {
+          client['loadedCommands'][name] = command
+        })
+      })
+    }
     client['loadedModules'][name] = module
-  }).catch(log.error)
+  }).catch(log.warn)
 }
 
 const parseArgs = (messageContent: string) => {
@@ -115,21 +131,44 @@ const runCommand = async (message: Message, command: Command, args: string[]) =>
     return message.channel.send(
       `Too many arguments for \`${command.name}\`. (max: ${command.maxArgs}, `
       + `you might need to quote an argument) `)
-  } else if (args.length < command.minArgs) {
+  }
+  if (args.length < command.minArgs) {
     return message.channel.send(`Too few arguments for \`${command.name}\`. (min: ${command.minArgs})`)
-  } else {
-    try {
-      return await command.run(message, args)
-    } catch (e) {
-      await message.channel.send(`Error: \`${e}\``)
-      return log.warn(`\`${command.name} ${args}\` errored with \`${e}\``, message.client)
+  }
+  try {
+    // TODO: test if shit works with an empty permissionLevel
+    if (command.permissionLevel && command.permissionLevel > 0) {
+      switch (command.permissionLevel) {
+        case 1:
+          if (!message.member.hasPermission('MANAGE_MESSAGES')) {
+            return message.channel.send(`You don't have permission to execute this command, which requires the Manage Messages permission.`)
+          }
+          break
+        case 2:
+          if (!message.member.hasPermission('MANAGE_GUILD')) {
+            return message.channel.send(`You don't have permission to execute this command, which requires the Manage Server permission.`)
+          }
+          break
+        case 3:
+          if (message.author.id !== client['ownerId']) {
+            return message.channel.send(`You don't have permission to execute this command, which requires ownership of this bot.`)
+          }
+          break
+        default:
+          log.warn(`\`${command.name}\` has an invalid permissionLevel of ${command.permissionLevel}`, message.client)
+          return message.channel.send(`Internal error: invalid permissionLevel (${command.permissionLevel}) on command \`${command.name}\``)
+      }
     }
+    return await command.run(message, args)
+  } catch (e) {
+    await message.channel.send(`Error: \`${e}\``)
+    return log.warn(`\`${command.name} ${args}\` errored with \`${e}\``, message.client)
   }
 }
 
 client.on('ready', async () => {
   client['botGuild'] = client.guilds.get(process.env.BOT_GUILD)
-  log.info(`Logged in as ${client.user.tag}!`, client)
+  log.info(`Logged in as ${client.user.tag}! Add bot with https://discordapp.com/api/oauth2/authorize?client_id=${client.user.id}&scope=bot`, client)
   fs.readdir('./modules/', (err, files) => {
     if (err) {
       return log.error('Failed to load modules folder', client)
@@ -146,23 +185,11 @@ client.on('ready', async () => {
 client.on('message', async (message: Message) => {
   await client['guildData'].ensure(message.guild.id, { prefix: 's.' })
   const prefix = await client['guildData'].get(message.guild.id, 'prefix')
-  // TODO: manage guild specific aliases here
-  // TODO: permission levels
-
-  // TODO: iterating over all the modules is SLOW, make a loadedCommands
   if (message.content.startsWith(`${prefix}`) && !message.author.bot) {
-    Object.keys(client['loadedModules']).forEach(async moduleIndex => {
-      client['loadedModules'][moduleIndex].commands.forEach(async command => {
-        const commandName = message.content.split(prefix)[1].split(' ')[0]
-        const possibleNames = command.aliases
-          ? command.aliases.concat([command.name])
-          : [command.name]
-        if (possibleNames.includes(commandName)) {
-          const messageContentWithoutPrefixOrCommandName = message.content.substr(
-            prefix.length + 1 + commandName.length)
-          await runCommand(message, command, parseArgs(messageContentWithoutPrefixOrCommandName))
-        }
-      })
-    })
+    const commandName = message.content.split(prefix)[1].split(' ')[0]
+    if (client['loadedCommands'][commandName]) {
+      const messageContentWithoutPrefixOrCommandName = message.content.substr(prefix.length + 1 + commandName.length)
+      await runCommand(message, client['loadedCommands'][commandName], parseArgs(messageContentWithoutPrefixOrCommandName))
+    }
   }
 })
